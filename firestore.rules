@@ -14,10 +14,10 @@ service cloud.firestore {
 
     match /users/{userId} {
       allow read: if true;
-      allow create: if request.resource.data.keys().hasOnly(['name','role','pin','isDefaultPin','order'])
+      allow create: if request.resource.data.keys().hasOnly(['name','role','pin','isDefaultPin','order','address'])
                     && request.resource.data.pin is string
                     && request.resource.data.pin.size() == 4;
-      allow update: if request.resource.data.keys().hasOnly(['name','role','pin','isDefaultPin','order'])
+      allow update: if request.resource.data.keys().hasOnly(['name','role','pin','isDefaultPin','order','address'])
                     && request.resource.data.pin is string
                     && request.resource.data.pin.size() == 4
                     && request.resource.data.name is string
@@ -33,7 +33,7 @@ service cloud.firestore {
                             && request.resource.data.date.size() == 10
                             && request.resource.data.userId is string
                             && request.resource.data.keys().hasOnly(
-                                 ['date','userId','role','breakfast','lunch','dinner','updatedAt']);
+                                 ['date','userId','role','breakfast','lunch','dinner','adhoc','updatedAt']);
       allow delete: if false;
     }
 

@@ -2,16 +2,16 @@
 //  Tiffin Tracker — UI
 // ============================================================
 import { Store } from "./store.js";
-import { CURRENCY, MEALS } from "./config.js";
+import { CURRENCY, MEALS, MENU_PRICES, REVOKE_MINUTES } from "./config.js";
 
 const SESSION_KEY = "tiffin_session";
 const TABS = ["entry", "dash", "settings"]; // left → right order of the swipe carousel
 const app = document.getElementById("app");
 
-// The handful of orders that make up most days — one tap adds the line,
-// no quantity prompt. Shown to both friends (what was in their tiffin)
-// and the provider (what went into each tiffin).
-const QUICK_ITEMS = ["Full Tiffin", "Half Tiffin", "5 Roti + Sabzi", "4 Roti + Sabzi", "2 Roti + Sabzi"];
+const priceOf = (name) => {
+  const hit = MENU_PRICES.find((p) => p.name.toLowerCase() === String(name || "").trim().toLowerCase());
+  return hit ? hit.price : null;
+};
 
 // Fixed consumer profile picker — these 4 labels never change even if the
 // underlying user's display name is edited later in Settings.
@@ -21,6 +21,11 @@ const CONSUMER_PROFILES = [
   { id: "f3", label: "Gupichand" },
   { id: "f4", label: "cheenuPrasad" },
 ];
+
+// A safely-early lower bound for the "give me everything" queries behind
+// Bills / History — cheap even on Firestore since range queries jump
+// straight to the first real match rather than scanning from here.
+const EARLIEST_DATE = "2020-01-01";
 
 // ---------------------------------------------------------------- state
 const state = {
@@ -40,11 +45,55 @@ const state = {
   rangeTo: null,
   entriesReady: false,
   unsubEntries: null,
+
+  // hamburger menu: Bills / History (lifetime data, independent of the
+  // month-scoped `entries` above)
+  overlay: null,        // null | "bills" | "history" | "order"
+  orderMeal: null,      // which meal slot the order overlay is showing
+  orderDate: null,      // which day that slot belongs to (today or tomorrow)
+  orderDraft: null,     // in-progress order form state
+  rejecting: null,      // supplier is typing a rejection reason: {userId, meal, text}
+  historyMeal: null,    // null | "breakfast" | "lunch" | "dinner" | "adhoc"
+  historyFrom: null,    // yyyy-mm-dd — reset to null to recompute the default
+  historyTo: null,      // yyyy-mm-dd
+  allEntries: {},
+  allEntriesReady: false,
+  unsubAll: null,
 };
 
 let mounted = null;     // DOM refs for the logged-in shell, once built
 let authRendered = false;
 let heightObserver = null; // keeps .tabs-viewport exactly as tall as the active tab
+let tickTimer = null;      // 1s ticker for the live cancellation countdown
+let clockTimer = null;     // watches for a meal's cutoff passing while the page is open
+
+let slotTimer = null;      // ticks the "cancellable for m:ss" labels on My Meals
+let slotCountdowns = [];   // { node, order } pairs the ticker keeps current
+
+function startTick(fn) {
+  stopTick();
+  tickTimer = setInterval(fn, 1000);
+}
+function stopTick() {
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+}
+
+/** Keeps every visible countdown honest without redrawing the whole panel. */
+function runSlotCountdowns() {
+  if (slotTimer) { clearInterval(slotTimer); slotTimer = null; }
+  if (!slotCountdowns.length) return;
+  const paint = () => {
+    let live = 0;
+    slotCountdowns.forEach(({ node, order }) => {
+      const ms = revokeLeftMs(order);
+      if (ms > 0) { node.textContent = `Cancellable for ${fmtLeft(ms)}`; live += 1; }
+      else node.textContent = "Waiting for the supplier";
+    });
+    if (!live) { clearInterval(slotTimer); slotTimer = null; }
+  };
+  paint();
+  slotTimer = setInterval(paint, 1000);
+}
 
 // ---------------------------------------------------------------- utils
 function h(tag, props = {}, ...kids) {
@@ -65,13 +114,20 @@ function h(tag, props = {}, ...kids) {
 function todayStr(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
-function fmtDate(s) {
+function fmtDayPlain(s) {
   const [y, m, d] = s.split("-").map(Number);
-  const dt = new Date(y, m - 1, d);
-  let out = dt.toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" });
-  if (s === todayStr()) out += " · Today";
-  return out;
+  return new Date(y, m - 1, d).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" });
 }
+function fmtDate(s) {
+  return fmtDayPlain(s) + (s === todayStr() ? " · Today" : "");
+}
+function addDays(s, n) {
+  const [y, m, d] = s.split("-").map(Number);
+  return todayStr(new Date(y, m - 1, d + n));
+}
+const tomorrowStr = () => addDays(todayStr(), 1);
+/** The two days you can order for: today, and tonight-for-tomorrow. */
+const ORDER_DAYS = () => [todayStr(), tomorrowStr()];
 function monthBounds(s) {
   const [y, m] = s.split("-").map(Number);
   const last = new Date(y, m, 0).getDate();
@@ -88,6 +144,75 @@ const provider = () => state.users.find((u) => u.role === "provider");
 const itemsText = (items) =>
   (items || []).filter((i) => i.name).map((i) => `${i.name} ×${i.qty || 1}`).join(", ");
 const loadingBlock = () => h("div", { class: "empty" }, "Loading…");
+
+// ---------------------------------------------------------------- orders
+const mealDef = (key) => MEALS.find((m) => m.key === key);
+
+/** Is this meal still orderable right now? Adhoc (cutoff 24) always is. */
+function mealOpen(meal, now = new Date()) {
+  return now.getHours() + now.getMinutes() / 60 < meal.cutoff;
+}
+
+/** Every field is always written, so Firestore's deep merge can't leave stale keys behind. */
+function makeOrder({ items, amount, address, expectedTime, placedAt, status, reason, decidedAt }) {
+  const st = status || "placed";
+  return {
+    taken: st !== "rejected",   // keeps dashboard/bills money math working untouched
+    placed: true,
+    status: st,
+    placedAt: placedAt || Date.now(),
+    decidedAt: decidedAt || 0,
+    items: (items || []).map((i) => ({ name: String(i.name || "").trim(), qty: Math.max(1, Number(i.qty) || 1) })),
+    amount: Number(amount) || 0,
+    address: address || "",
+    expectedTime: expectedTime || "",
+    reason: reason || "",
+  };
+}
+
+const myOrder = (mealKey, date = todayStr(), uid = state.me && state.me.id) => {
+  const e = getEntry(date, uid);
+  return (e && e[mealKey]) || null;
+};
+
+/**
+ * What My Meals should do with one slot on one day.
+ * Cutoffs only bite on today — tomorrow's slots are all open, which is the
+ * whole point of being able to order tomorrow's breakfast tonight.
+ * A rejected order re-opens the slot even past its cutoff, since the supplier
+ * turned it down and the customer deserves a fair chance to send a new one.
+ */
+function slotState(mealKey, date = todayStr()) {
+  const meal = mealDef(mealKey);
+  const order = myOrder(mealKey, date);
+  const future = date > todayStr();
+  const live = order && order.status !== "rejected";
+  const canOrder = !live && (future || mealOpen(meal) || (order && order.status === "rejected"));
+  return { meal, order, canOrder, date, visible: canOrder || !!order };
+}
+
+const revokeLeftMs = (order) =>
+  order && order.status === "placed" ? order.placedAt + REVOKE_MINUTES * 60000 - Date.now() : 0;
+
+function fmtLeft(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+function fmtClock(ms) {
+  return new Date(ms).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" });
+}
+function fmtTimeStr(t) {
+  if (!t) return "";
+  const [hh, mm] = t.split(":").map(Number);
+  const d = new Date(); d.setHours(hh, mm, 0, 0);
+  return d.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" });
+}
+function StatusPill(order) {
+  if (!order) return h("span", { class: "pill q" }, "Not ordered");
+  if (order.status === "accepted") return h("span", { class: "pill y" }, "Accepted");
+  if (order.status === "rejected") return h("span", { class: "pill n" }, "Rejected");
+  return h("span", { class: "pill b" }, "Waiting");
+}
 
 /** Avatar photo. Friends share one illustration, tinted + ringed per person. */
 function Avatar(u, size = "md") {
@@ -120,7 +245,7 @@ function toast(msg, bad = false) {
 
     const saved = users.find((x) => x.id === localStorage.getItem(SESSION_KEY));
     if (saved) {
-      state.me = saved; state.tab = "dash";
+      state.me = saved; state.tab = "entry";
       mountApp(); ensureRange();
       requestAnimationFrame(() => positionTrack(false));
       return;
@@ -131,7 +256,10 @@ function toast(msg, bad = false) {
 })();
 
 function ensureRange() {
-  const [from, to] = monthBounds(state.date);
+  let [from, to] = monthBounds(state.date);
+  // Tomorrow is orderable, so it must be inside the subscribed window even on
+  // the last day of a month.
+  if (tomorrowStr() > to && todayStr() <= to) to = tomorrowStr();
   if (from === state.rangeFrom && to === state.rangeTo) {
     refreshEntryPanel(); refreshDashPanel();
     return;
@@ -150,24 +278,6 @@ function changeDate(newDate) {
   ensureRange();
 }
 
-// ---------------------------------------------------------------- draft
-function buildDraft() {
-  const e = getEntry(state.date, state.me.id);
-  const d = {};
-  MEALS.forEach(({ key }) => {
-    const m = e && e[key];
-    if (state.me.role === "provider") {
-      d[key] = m
-        ? { count: m.count ?? 0, tiffins: (m.tiffins || []).map((t) => ({ items: cloneItems(t.items) })) }
-        : { count: 0, tiffins: [] };
-    } else {
-      d[key] = m
-        ? { status: m.taken ? "taken" : "skipped", amount: m.amount ?? "", items: cloneItems(m.items) }
-        : { status: null, amount: "", items: [] };
-    }
-  });
-  state.draft = d; state.draftDate = state.date;
-}
 const cloneItems = (items) => (items || []).map((i) => ({ name: i.name || "", qty: i.qty ?? 1 }));
 
 // ---------------------------------------------------------------- logged-out flow
@@ -247,7 +357,7 @@ function PinScreen() {
       setTimeout(() => dots.classList.remove("shake"), 400);
       pin = ""; paint(); return;
     }
-    state.me = u; state.tab = "dash"; state.draftDate = null;
+    state.me = u; state.tab = "entry"; state.draftDate = null;
     localStorage.setItem(SESSION_KEY, u.id);
     mountApp(); ensureRange();
     requestAnimationFrame(() => positionTrack(false));
@@ -289,7 +399,7 @@ function mountApp() {
     h("div", { class: "tab-panel" }, settingsInner));
 
   app.appendChild(viewport);
-  app.appendChild(NavBar());
+  app.appendChild(HamburgerMenu());
 
   mounted = { viewport, mealsInner, dashInner, settingsInner };
 
@@ -305,6 +415,25 @@ function mountApp() {
   heightObserver = new ResizeObserver(() => syncHeight(true));
   Array.from(viewport.children).forEach((panel) => heightObserver.observe(panel));
   syncHeight(false);
+
+  if (state.overlay) renderOverlay(); // survives a re-mount triggered by a users/entries update
+  startClockWatch();
+}
+
+/**
+ * Meals close on the clock, so the home screen has to notice a cutoff passing
+ * even if nobody touches the app. Only redraws when the visible set changes.
+ */
+function startClockWatch() {
+  if (clockTimer) clearInterval(clockTimer);
+  const snapshot = () => MEALS.filter((m) => mealOpen(m)).map((m) => m.key).join(",");
+  let last = snapshot();
+  clockTimer = setInterval(() => {
+    const now = snapshot();
+    if (now === last) return;
+    last = now;
+    refreshEntryPanel();
+  }, 30000);
 }
 
 // Keeps .tabs-viewport exactly as tall as the tab currently in view, instead
@@ -329,9 +458,13 @@ function syncHeight(animate) {
 
 function refreshEntryPanel() {
   if (!mounted || !state.entriesReady) return;
-  if (state.draftDate === state.date) return; // keep any in-progress typing intact
-  buildDraft();
   mounted.mealsInner.replaceChildren(state.me.role === "provider" ? ProviderScreen() : FriendScreen());
+  // Keep an open order sheet in sync when the supplier decides on it — but never
+  // while it's a form the customer is typing into.
+  if (state.overlay === "order") {
+    const o = myOrder(state.orderMeal, state.orderDate || todayStr());
+    if (o && o.status !== "rejected") renderOverlay();
+  }
 }
 function refreshDashPanel() {
   if (!mounted) return;
@@ -371,194 +504,386 @@ function attachScrollSync() {
   window.addEventListener("resize", () => { positionTrack(false); syncHeight(false); });
 }
 
-function NavBar() {
-  const tabs = [
-    { id: "entry", icon: state.me.role === "provider" ? "🍱" : "🍽", label: state.me.role === "provider" ? "Tiffins" : "Meals" },
-    { id: "dash", icon: "📊", label: "Dashboard" },
-    { id: "settings", icon: "⚙", label: "Settings" },
-  ];
-  return h("nav", { class: "nav" },
-    tabs.map((t) => h("button", {
-      class: state.tab === t.id ? "on" : "", "data-tab": t.id,
-      onclick: () => goTo(t.id),
-    }, h("span", { class: "ni" }, t.icon), h("span", { class: "lb" }, t.label))));
-}
-
 function DateBar() {
   return h("div", { class: "datebar" },
-    h("input", { type: "date", value: state.date, max: todayStr(),
+    h("input", { type: "date", value: state.date, max: tomorrowStr(),
       onchange: (e) => changeDate(e.target.value) }),
     h("button", { class: "chip" + (state.date === todayStr() ? " on" : ""),
       onclick: () => changeDate(todayStr()) }, "Today"));
 }
 
 // ---------------------------------------------------------------- item editor
-function ItemsEditor(list, quickAdds) {
+/**
+ * Item lines for an order. The chips carry the fixed menu price, so one tap
+ * adds the line *and* moves the amount — no quantity prompt, no maths.
+ */
+function ItemsEditor(draft, onChange) {
+  const list = draft.items;
   const box = h("div", { class: "items" });
+
+  const linePrice = (it) => {
+    const p = priceOf(it.name);
+    return p === null ? "—" : money(p * Math.max(1, Number(it.qty) || 1));
+  };
+  const repaintPrices = () => {
+    box.querySelectorAll(".item-row").forEach((row, i) => {
+      if (list[i]) row.querySelector(".ip").textContent = linePrice(list[i]);
+    });
+  };
   const paint = () => {
     box.innerHTML = "";
     list.forEach((it, i) => {
       box.appendChild(h("div", { class: "item-row" },
         h("input", { class: "iname", type: "text", placeholder: "Item name", value: it.name,
-          oninput: (e) => (it.name = e.target.value) }),
-        h("input", { class: "iqty", type: "number", min: "1", step: "1", placeholder: "Qty", value: it.qty ?? 1,
-          oninput: (e) => (it.qty = e.target.value) }),
+          oninput: (e) => { it.name = e.target.value; onChange(); repaintPrices(); } }),
+        h("input", { class: "iqty", type: "number", min: "1", step: "1", value: it.qty ?? 1,
+          oninput: (e) => { it.qty = e.target.value; onChange(); repaintPrices(); } }),
+        h("span", { class: "ip" }, linePrice(it)),
         h("button", { class: "rm", type: "button", title: "Remove",
-          onclick: () => { list.splice(i, 1); paint(); } }, "×")));
+          onclick: () => { list.splice(i, 1); paint(); onChange(); } }, "×")));
     });
-    if (!list.length) box.appendChild(h("p", { class: "note" }, "No items added."));
+    if (!list.length) box.appendChild(h("p", { class: "note" }, "Nothing added yet — tap something above."));
   };
   paint();
-  const quickRow = quickAdds ? h("div", { class: "quick-add-wrap" },
-    h("div", { class: "qa-label" }, "Quick add"),
+
+  const chips = h("div", { class: "quick-add-wrap" },
+    h("div", { class: "qa-label" }, "Menu"),
     h("div", { class: "quick-add" },
-      quickAdds.map((label) => h("button", { class: "qa-chip", type: "button",
+      MENU_PRICES.map((m) => h("button", { class: "qa-chip", type: "button",
         onclick: () => {
-          const blank = list.findIndex((it) => !it.name.trim());
-          if (blank !== -1) list[blank] = { name: label, qty: 1 };
-          else list.push({ name: label, qty: 1 });
-          paint();
-        } }, label)))
-  ) : null;
-  return h("div", {}, quickRow, box,
+          const blank = list.findIndex((it) => !String(it.name).trim());
+          if (blank !== -1) list[blank] = { name: m.name, qty: 1 };
+          else list.push({ name: m.name, qty: 1 });
+          paint(); onChange();
+        } },
+        h("span", { class: "qa-n" }, m.name),
+        h("span", { class: "qa-p" }, money(m.price))))));
+
+  return h("div", {}, chips, box,
     h("button", { class: "add-item", type: "button",
-      onclick: () => { list.push({ name: "", qty: 1 }); paint(); } }, "+ Add item"));
+      onclick: () => { list.push({ name: "", qty: 1 }); paint(); onChange(); } }, "+ Add custom item"));
 }
 
-// ---------------------------------------------------------------- friend screen
+const computeAmount = (items) => (items || []).reduce((s, it) => {
+  const p = priceOf(it.name);
+  return s + (p === null ? 0 : p * Math.max(1, Number(it.qty) || 1));
+}, 0);
+
+// ---------------------------------------------------------------- my meals (home)
 function FriendScreen() {
-  if (!state.draft) return loadingBlock();
   const box = h("div", {});
+  slotCountdowns = [];
   box.appendChild(h("h1", { class: "page-title" }, "My Meals"));
-  box.appendChild(DateBar());
-  box.appendChild(h("p", { class: "note" }, fmtDate(state.date)));
-  MEALS.forEach((meal) => box.appendChild(FriendMealCard(meal)));
+
+  ORDER_DAYS().forEach((date, i) => {
+    const slots = MEALS.map((m) => slotState(m.key, date)).filter((s) => s.visible);
+    if (!slots.length) return;
+    box.appendChild(DayHead(date, i === 1));
+    slots.forEach((s) => box.appendChild(MealSlotCard(s)));
+  });
+
+  runSlotCountdowns();
   return box;
 }
 
-function FriendMealCard(meal) {
-  const d = state.draft[meal.key];
-  const card = h("div", { class: "card" });
-  const statusEl = h("span", { class: "status" });
-  const yes = h("button", { type: "button" }, "Taken");
-  const no = h("button", { type: "button" }, "Not taken");
+function DayHead(date, isNext) {
+  return h("div", { class: "day-head" + (isNext ? " next" : "") },
+    h("span", { class: "dh-tag" }, isNext ? "Tomorrow" : "Today"),
+    h("span", { class: "dh-date" }, fmtDayPlain(date)));
+}
+
+function MealSlotCard(s) {
+  const { meal, order, canOrder, date } = s;
+  const card = h("button", { class: "card meal-slot", type: "button",
+    onclick: () => openOrder(meal.key, date) });
+
+  card.appendChild(h("div", { class: "card-head" },
+    h("div", { class: "icon" }, meal.icon),
+    h("h2", {}, meal.label),
+    h("span", { class: "status" }, StatusPill(order))));
+
+  if (order) {
+    card.appendChild(h("div", { class: "slot-line" },
+      h("div", { class: "sl-items" }, itemsText(order.items) || "—"),
+      h("div", { class: "sl-amt" }, money(order.amount))));
+    if (order.status === "rejected") {
+      if (order.reason) card.appendChild(h("div", { class: "reject-note" }, "Supplier: " + order.reason));
+      card.appendChild(h("div", { class: "sub-items" }, "Tap to send a new order →"));
+    } else if (order.status === "placed") {
+      const left = revokeLeftMs(order);
+      const node = h("div", { class: "sub-items" },
+        left > 0 ? `Cancellable for ${fmtLeft(left)}` : "Waiting for the supplier");
+      card.appendChild(node);
+      if (left > 0) slotCountdowns.push({ node, order });
+    }
+  } else {
+    card.appendChild(h("div", { class: "slot-line" },
+      h("div", { class: "sl-items muted" }, canOrder ? "Tap to place an order" : "Closed for today"),
+      h("div", { class: "sl-amt faint" }, "›")));
+  }
+  return card;
+}
+
+// ---------------------------------------------------------------- order sheet
+function openOrder(mealKey, date = todayStr()) {
+  const meal = mealDef(mealKey);
+  const existing = myOrder(mealKey, date);
+  state.orderMeal = mealKey;
+  state.orderDate = date;
+  if (!existing || existing.status === "rejected") {
+    state.orderDraft = {
+      items: existing ? cloneItems(existing.items) : [],
+      amount: existing ? existing.amount : 0,
+      manual: false,
+      address: (existing && existing.address) || state.me.address || "",
+      expectedTime: (existing && existing.expectedTime) || meal.defaultTime || "",
+    };
+  } else {
+    state.orderDraft = null;
+  }
+  state.overlay = "order";
+  renderOverlay();
+}
+
+function OrderScreen() {
+  const meal = mealDef(state.orderMeal);
+  const date = state.orderDate || todayStr();
+  const order = myOrder(state.orderMeal, date);
+  const live = order && order.status !== "rejected";
+  const title = meal.label + (date === todayStr() ? "" : " · Tomorrow");
+  const { wrap, body } = OverlayShell(title, closeOverlay);
+  body.appendChild(live ? PlacedOrderView(meal, order) : OrderForm(meal, order, date));
+  return wrap;
+}
+
+function PlacedOrderView(meal, order) {
+  const box = h("div", {});
+
+  const lines = order.items.map((it) => {
+    const p = priceOf(it.name);
+    return h("div", { class: "meal-line" },
+      h("div", { class: "mb" }, `${it.name} ×${it.qty}`),
+      h("div", { class: "mr" }, p === null ? "" : money(p * it.qty)));
+  });
+  box.appendChild(h("div", { class: "card" },
+    h("div", { class: "card-head" },
+      h("div", { class: "icon" }, meal.icon), h("h2", {}, meal.label + " order"),
+      h("span", { class: "status" }, StatusPill(order))),
+    lines,
+    h("div", { class: "meal-line total-line" },
+      h("div", { class: "mb" }, h("strong", {}, "Total")),
+      h("div", { class: "mr" }, money(order.amount)))));
+
+  box.appendChild(h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "Delivery")),
+    h("div", { class: "kv" }, h("span", {}, "Address"), h("strong", {}, order.address || "—")),
+    h("div", { class: "kv" }, h("span", {}, "Expected"), h("strong", {}, fmtTimeStr(order.expectedTime) || "Any time")),
+    h("div", { class: "kv" }, h("span", {}, "Placed at"), h("strong", {}, fmtClock(order.placedAt)))));
+
+  if (order.status === "accepted") {
+    box.appendChild(h("div", { class: "banner ok" }, "The supplier accepted this order — it's being prepared."));
+    return box;
+  }
+
+  const holder = h("div", {});
+  const paint = () => {
+    const ms = revokeLeftMs(order);
+    holder.replaceChildren(ms > 0
+      ? h("div", {},
+          h("p", { class: "note" }, `You can still take this back for ${fmtLeft(ms)}.`),
+          h("div", { class: "actions left" },
+            h("button", { class: "btn danger", type: "button", onclick: cancelOrder }, "Cancel order")))
+      : h("p", { class: "note" },
+          `The ${REVOKE_MINUTES}-minute cancellation window has passed — speak to the supplier directly.`));
+  };
+  paint();
+  if (revokeLeftMs(order) > 0) startTick(paint);
+  box.appendChild(holder);
+  return box;
+}
+
+async function cancelOrder() {
+  const mealKey = state.orderMeal;
+  await Store.saveMeal(state.orderDate || todayStr(), state.me.id, "friend", mealKey, null);
+  closeOverlay();
+  toast("Order cancelled");
+}
+
+function OrderForm(meal, prev, date) {
+  const d = state.orderDraft;
+  const box = h("div", {});
+
+  if (prev && prev.status === "rejected") {
+    box.appendChild(h("div", { class: "banner bad" },
+      h("strong", {}, "The supplier turned this one down"),
+      prev.reason ? h("div", { class: "why" }, prev.reason) : null,
+      h("div", { class: "sub-items" }, "Change what you need and send it again.")));
+  }
 
   const amountInput = h("input", { type: "number", min: "0", step: "1", inputmode: "decimal",
-    placeholder: "0", value: d.amount, oninput: (e) => (d.amount = e.target.value) });
-  const amountField = h("div", { class: "field" },
-    h("label", {}, "Amount ", h("span", { class: "req" }, "*")),
-    h("div", { class: "amount-wrap" }, h("span", {}, CURRENCY), amountInput));
-  const itemsField = h("div", { class: "field" },
-    h("label", {}, "Items ", h("span", { class: "opt" }, "(optional)")),
-    ItemsEditor(d.items, QUICK_ITEMS));
-  const saveBtn = h("button", { class: "btn", type: "button" }, "Save");
-  const actions = h("div", { class: "actions" }, saveBtn);
-
-  function paintToggle() {
-    yes.className = d.status === "taken" ? "on-y" : "";
-    no.className = d.status === "skipped" ? "on-n" : "";
-    const show = d.status === "taken";
-    amountField.classList.toggle("hide", !show);
-    itemsField.classList.toggle("hide", !show);
-    actions.classList.toggle("hide", d.status === null);
-    statusEl.replaceChildren(
-      d.status === "taken" ? h("span", { class: "pill y" }, "Taken")
-      : d.status === "skipped" ? h("span", { class: "pill n" }, "Not taken")
-      : h("span", { class: "pill q" }, "Not filled"));
-  }
-  yes.onclick = () => {
-    d.status = "taken";
-    if (!d.items.length) { d.items.push({ name: "", qty: 1 }); rebuildItems(); }
-    paintToggle();
+    placeholder: "0", value: d.amount || "",
+    oninput: (e) => { d.manual = true; d.amount = e.target.value; e.target.classList.remove("err"); } });
+  const sync = () => {
+    if (d.manual) return;
+    d.amount = computeAmount(d.items);
+    amountInput.value = d.amount || "";
   };
-  no.onclick = () => { d.status = "skipped"; paintToggle(); };
-  function rebuildItems() { itemsField.replaceChild(ItemsEditor(d.items, QUICK_ITEMS), itemsField.lastChild); }
+  const editor = ItemsEditor(d, sync);
+  sync();
 
-  saveBtn.onclick = async () => {
-    if (d.status === "taken") {
-      const amt = Number(d.amount);
-      if (!d.amount || isNaN(amt) || amt <= 0) {
-        amountInput.classList.add("err"); amountInput.focus();
-        toast("Amount is required", true); return;
-      }
-      amountInput.classList.remove("err");
-      const items = d.items.filter((i) => i.name.trim())
-        .map((i) => ({ name: i.name.trim(), qty: Math.max(1, Number(i.qty) || 1) }));
-      await Store.saveMeal(state.date, state.me.id, "friend", meal.key, { taken: true, amount: amt, items });
-    } else {
-      await Store.saveMeal(state.date, state.me.id, "friend", meal.key, { taken: false, amount: 0, items: [] });
+  box.appendChild(h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("div", { class: "icon" }, meal.icon), h("h2", {}, "What do you need?")),
+    editor));
+
+  box.appendChild(h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "Amount")),
+    h("div", { class: "amount-wrap" }, h("span", {}, CURRENCY), amountInput),
+    h("div", { class: "actions left" },
+      h("button", { class: "btn ghost", type: "button",
+        onclick: () => { d.manual = false; sync(); } }, "Reset to menu price"))));
+
+  const addrInput = h("input", { type: "text", value: d.address, maxlength: "160",
+    placeholder: "Flat / building / landmark",
+    oninput: (e) => { d.address = e.target.value; e.target.classList.remove("err"); } });
+  const timeInput = h("input", { class: "narrow", type: "time", value: d.expectedTime,
+    oninput: (e) => (d.expectedTime = e.target.value) });
+  box.appendChild(h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "Delivery details")),
+    h("div", { class: "field" }, h("label", {}, "Full address ", h("span", { class: "req" }, "*")), addrInput),
+    h("div", { class: "field" }, h("label", {}, "Expected time"), timeInput)));
+
+  const placeBtn = h("button", { class: "btn", type: "button" }, "Place order");
+  placeBtn.onclick = async () => {
+    const items = d.items.filter((i) => String(i.name).trim())
+      .map((i) => ({ name: i.name.trim(), qty: Math.max(1, Number(i.qty) || 1) }));
+    if (!items.length) return toast("Add at least one item", true);
+    const amt = Number(d.amount);
+    if (!amt || isNaN(amt) || amt <= 0) { amountInput.classList.add("err"); return toast("Amount must be more than 0", true); }
+    if (!d.address.trim()) { addrInput.classList.add("err"); addrInput.focus(); return toast("Address is required", true); }
+    const reorder = prev && prev.status === "rejected";
+    if (date === todayStr() && !mealOpen(meal) && !reorder)
+      return toast(meal.label + " has closed for today", true);
+
+    await Store.saveMeal(date, state.me.id, "friend", meal.key,
+      makeOrder({ items, amount: amt, address: d.address.trim(), expectedTime: d.expectedTime, status: "placed" }));
+    if (d.address.trim() !== (state.me.address || "")) {
+      try { await Store.updateUser(state.me.id, { address: d.address.trim() }); } catch (e) { console.warn(e); }
     }
-    saveBtn.textContent = "Saved ✓"; saveBtn.classList.add("saved");
-    setTimeout(() => { saveBtn.textContent = "Save"; saveBtn.classList.remove("saved"); }, 1500);
-    toast(meal.label + " saved");
+    closeOverlay();
+    toast("Order placed");
   };
-
-  card.appendChild(h("div", { class: "card-head" },
-    h("div", { class: "icon" }, meal.icon), h("h2", {}, meal.label), statusEl));
-  card.appendChild(h("div", { class: "seg" }, yes, no));
-  card.appendChild(amountField);
-  card.appendChild(itemsField);
-  card.appendChild(actions);
-  paintToggle();
-  return card;
-}
-
-// ---------------------------------------------------------------- provider screen
-function ProviderScreen() {
-  if (!state.draft) return loadingBlock();
-  const box = h("div", {});
-  box.appendChild(h("h1", { class: "page-title" }, "Tiffins"));
-  box.appendChild(DateBar());
-  box.appendChild(h("p", { class: "note" }, fmtDate(state.date)));
-  MEALS.forEach((meal) => box.appendChild(ProviderMealCard(meal)));
+  box.appendChild(h("div", { class: "actions" }, placeBtn));
   return box;
 }
 
-function ProviderMealCard(meal) {
-  const d = state.draft[meal.key];
-  const card = h("div", { class: "card" });
-  const statusEl = h("span", { class: "status" });
-  const tiffinBox = h("div", {});
+// ---------------------------------------------------------------- supplier: incoming orders
+function ProviderScreen() {
+  const box = h("div", {});
+  box.appendChild(h("h1", { class: "page-title" }, "Orders"));
 
-  const countInput = h("input", { class: "narrow", type: "number", min: "0", max: "20", step: "1",
-    inputmode: "numeric", placeholder: "0", value: d.count || "",
-    oninput: (e) => setCount(e.target.value) });
+  let any = false;
+  ORDER_DAYS().forEach((date, i) => {
+    const section = ProviderDay(date);
+    if (!section) return;
+    any = true;
+    box.appendChild(DayHead(date, i === 1));
+    section.forEach((el) => box.appendChild(el));
+  });
 
-  function setCount(v) {
-    const n = Math.max(0, Math.min(20, Number(v) || 0));
-    d.count = n;
-    while (d.tiffins.length < n) d.tiffins.push({ items: [{ name: "", qty: 1 }] });
-    if (d.tiffins.length > n) d.tiffins.length = n;
-    paintTiffins();
+  if (!any) box.appendChild(h("div", { class: "card empty" }, "No orders have come in yet."));
+  return box;
+}
+
+/** One day's incoming orders, grouped by meal. Returns null when there are none. */
+function ProviderDay(date) {
+  let total = 0, count = 0, waiting = 0;
+  const blocks = [];
+
+  MEALS.forEach((meal) => {
+    const rows = friends()
+      .map((u) => ({ u, o: myOrder(meal.key, date, u.id) }))
+      .filter((r) => r.o);
+    if (!rows.length) return;
+    const card = h("div", { class: "card" },
+      h("div", { class: "card-head" },
+        h("div", { class: "icon" }, meal.icon), h("h2", {}, meal.label),
+        h("span", { class: "status" },
+          h("span", { class: "pill b" }, `${rows.length} order${rows.length > 1 ? "s" : ""}`))));
+    rows.forEach(({ u, o }) => {
+      count += 1;
+      if (o.status !== "rejected") total += Number(o.amount || 0);
+      if (o.status === "placed") waiting += 1;
+      card.appendChild(OrderRow(u, meal, o, date));
+    });
+    blocks.push(card);
+  });
+
+  if (!blocks.length) return null;
+
+  const summary = h("div", { class: "card person-block" },
+    h("div", { class: "ph" }, Avatar(state.me, "md"),
+      h("strong", {}, `${count} order${count === 1 ? "" : "s"}`),
+      h("span", { class: "tot" }, money(total))),
+    waiting ? h("div", { class: "meal-line", style: "border-top:none;padding:4px 0 0" },
+      h("div", { class: "mb", style: "color:var(--muted);font-size:13.5px" },
+        `${waiting} waiting on you`)) : null);
+
+  return [summary, ...blocks];
+}
+
+function OrderRow(u, meal, o, date) {
+  const row = h("div", { class: "order-row" });
+  row.appendChild(h("div", { class: "or-head" },
+    Avatar(u, "sm"), h("strong", {}, u.name), StatusPill(o),
+    h("span", { class: "or-amt" }, money(o.amount))));
+  row.appendChild(h("div", { class: "sub-items" }, itemsText(o.items) || "—"));
+  row.appendChild(h("div", { class: "sub-items" },
+    [o.address || "No address",
+     o.expectedTime ? "by " + fmtTimeStr(o.expectedTime) : null,
+     "placed " + fmtClock(o.placedAt)].filter(Boolean).join(" · ")));
+  if (o.status === "rejected" && o.reason)
+    row.appendChild(h("div", { class: "reject-note" }, "You said: " + o.reason));
+
+  const isRejecting = state.rejecting && state.rejecting.userId === u.id
+    && state.rejecting.meal === meal.key && state.rejecting.date === date;
+  if (isRejecting) {
+    const input = h("input", { type: "text", placeholder: "e.g. sabzi finished for today",
+      value: state.rejecting.text, oninput: (e) => (state.rejecting.text = e.target.value) });
+    row.appendChild(h("div", { class: "field" }, h("label", {}, "Reason (they'll see this)"), input));
+    row.appendChild(h("div", { class: "actions left" },
+      h("button", { class: "btn danger", type: "button",
+        onclick: () => decide(u, meal, date, "rejected", input.value) }, "Send rejection"),
+      h("button", { class: "btn ghost", type: "button",
+        onclick: () => { state.rejecting = null; refreshEntryPanel(); } }, "Back")));
+    setTimeout(() => input.focus(), 0);
+  } else if (o.status === "placed") {
+    row.appendChild(h("div", { class: "actions left" },
+      h("button", { class: "btn", type: "button", onclick: () => decide(u, meal, date, "accepted") }, "Accept"),
+      h("button", { class: "btn ghost", type: "button",
+        onclick: () => { state.rejecting = { userId: u.id, meal: meal.key, date, text: "" }; refreshEntryPanel(); } }, "Reject")));
+  } else if (o.status === "accepted") {
+    row.appendChild(h("div", { class: "actions left" },
+      h("button", { class: "btn ghost", type: "button",
+        onclick: () => { state.rejecting = { userId: u.id, meal: meal.key, date, text: "" }; refreshEntryPanel(); } },
+        "Reject after all")));
   }
-  function paintTiffins() {
-    tiffinBox.innerHTML = "";
-    d.tiffins.forEach((t, i) =>
-      tiffinBox.appendChild(h("div", { class: "tiffin" },
-        h("h3", {}, `Tiffin ${i + 1}`), ItemsEditor(t.items, QUICK_ITEMS))));
-    statusEl.replaceChildren(d.count
-      ? h("span", { class: "pill b" }, `${d.count} tiffin${d.count > 1 ? "s" : ""}`)
-      : h("span", { class: "pill q" }, "Not filled"));
-  }
+  return row;
+}
 
-  const saveBtn = h("button", { class: "btn", type: "button" }, "Save");
-  saveBtn.onclick = async () => {
-    const tiffins = d.tiffins.map((t) => ({
-      items: t.items.filter((i) => i.name.trim())
-        .map((i) => ({ name: i.name.trim(), qty: Math.max(1, Number(i.qty) || 1) })) }));
-    await Store.saveMeal(state.date, state.me.id, "provider", meal.key, { count: d.count || 0, tiffins });
-    saveBtn.textContent = "Saved ✓"; saveBtn.classList.add("saved");
-    setTimeout(() => { saveBtn.textContent = "Save"; saveBtn.classList.remove("saved"); }, 1500);
-    toast(meal.label + " saved");
-  };
-
-  card.appendChild(h("div", { class: "card-head" },
-    h("div", { class: "icon" }, meal.icon), h("h2", {}, meal.label), statusEl));
-  card.appendChild(h("div", { class: "field" }, h("label", {}, "How many tiffins?"), countInput));
-  card.appendChild(tiffinBox);
-  card.appendChild(h("div", { class: "actions" }, saveBtn));
-  paintTiffins();
-  return card;
+async function decide(u, meal, date, status, reason) {
+  const text = String(reason || "").trim();
+  if (status === "rejected" && !text) return toast("Add a short reason first", true);
+  const cur = myOrder(meal.key, date, u.id);
+  if (!cur) return;
+  // Clear first: saving fires the store listeners synchronously in local mode,
+  // which would otherwise redraw this row with the reason form still open.
+  state.rejecting = null;
+  await Store.saveMeal(date, u.id, "friend", meal.key, makeOrder({
+    ...cur, status, decidedAt: Date.now(),
+    reason: status === "rejected" ? text : "",
+  }));
+  refreshEntryPanel();
+  toast(status === "accepted" ? "Order accepted" : "Rejection sent");
 }
 
 // ---------------------------------------------------------------- dashboard
@@ -571,62 +896,53 @@ function DashScreen() {
     h("button", { class: "chip" + (state.dashMode === "month" ? " on" : ""),
       onclick: () => { state.dashMode = "month"; refreshDashPanel(); } }, "Month")));
   box.appendChild(DateBar());
-  box.appendChild(h("p", { class: "note" },
-    state.dashMode === "day" ? fmtDate(state.date) : monthLabel(state.date)));
   box.appendChild(state.dashMode === "day" ? DayView() : MonthView());
   return box;
 }
 
 function DayView() {
   const box = h("div", {});
-  let any = false;
+  let any = false, dayTotal = 0, orders = 0, waiting = 0;
 
-  friends().forEach((u) => {
+  const people = state.me.role === "provider" ? friends() : [state.me];
+
+  people.forEach((u) => {
     const e = getEntry(state.date, u.id);
-    const total = MEALS.reduce((s, m) => s + (e && e[m.key]?.taken ? Number(e[m.key].amount || 0) : 0), 0);
+    const total = MEALS.reduce((s, m) => s + (e && e[m.key] && e[m.key].taken ? Number(e[m.key].amount || 0) : 0), 0);
     if (e) any = true;
+    dayTotal += total;
+
     const blk = h("div", { class: "card person-block" },
       h("div", { class: "ph" }, Avatar(u, "md"), h("strong", {}, u.name),
         h("span", { class: "tot" }, money(total))));
+
     MEALS.forEach((m) => {
       const v = e && e[m.key];
-      const pill = !v ? h("span", { class: "pill q" }, "—")
-        : v.taken ? h("span", { class: "pill y" }, "Taken")
-        : h("span", { class: "pill n" }, "Not taken");
-      const txt = v && v.taken && itemsText(v.items);
+      if (v) { orders += 1; if (v.status === "placed") waiting += 1; }
+      const mb = h("div", { class: "mb" }, StatusPill(v || null));
+      if (v) {
+        const txt = itemsText(v.items);
+        if (txt) mb.appendChild(h("div", { class: "sub-items" }, txt));
+        const meta = [v.expectedTime ? "by " + fmtTimeStr(v.expectedTime) : null,
+                      v.status === "rejected" && v.reason ? "“" + v.reason + "”" : null].filter(Boolean).join(" · ");
+        if (meta) mb.appendChild(h("div", { class: "sub-items" }, meta));
+      }
       blk.appendChild(h("div", { class: "meal-line" },
-        h("div", { class: "ml" }, m.label),
-        h("div", { class: "mb" }, pill, txt ? h("div", { class: "sub-items" }, txt) : null),
+        h("div", { class: "ml" }, m.label), mb,
         h("div", { class: "mr" }, v && v.taken ? money(v.amount) : "")));
     });
     box.appendChild(blk);
   });
 
-  const p = provider();
-  if (p) {
-    const e = getEntry(state.date, p.id);
-    if (e) any = true;
-    const tot = MEALS.reduce((s, m) => s + ((e && e[m.key]?.count) || 0), 0);
-    const blk = h("div", { class: "card person-block" },
-      h("div", { class: "ph" }, Avatar(p, "md"), h("strong", {}, p.name),
-        h("span", { class: "tot" }, `${tot} tiffins`)));
-    MEALS.forEach((m) => {
-      const v = e && e[m.key];
-      const mb = h("div", { class: "mb" });
-      if (!v || !v.count) mb.appendChild(h("span", { class: "pill q" }, "—"));
-      else {
-        mb.appendChild(h("span", { class: "pill b" }, `${v.count} tiffin${v.count > 1 ? "s" : ""}`));
-        (v.tiffins || []).forEach((t, i) => {
-          const txt = itemsText(t.items);
-          if (txt) mb.appendChild(h("div", { class: "sub-items" }, `Tiffin ${i + 1}: ${txt}`));
-        });
-      }
-      blk.appendChild(h("div", { class: "meal-line" }, h("div", { class: "ml" }, m.label), mb));
-    });
-    box.appendChild(blk);
-  }
+  if (!any) return h("div", { class: "card empty" }, "Nothing ordered on this day.");
 
-  if (!any) box.appendChild(h("div", { class: "card empty" }, "Nothing logged for this day yet."));
+  const head = h("div", { class: "card person-block" },
+    h("div", { class: "ph" }, h("strong", {}, state.me.role === "provider" ? "All orders" : "Your day"),
+      h("span", { class: "tot" }, money(dayTotal))),
+    h("div", { class: "meal-line", style: "border-top:none;padding:4px 0 0" },
+      h("div", { class: "mb", style: "color:var(--muted);font-size:13.5px" },
+        `${orders} order${orders === 1 ? "" : "s"}${waiting ? ` · ${waiting} still waiting` : ""}`)));
+  box.insertBefore(head, box.firstChild);
   return box;
 }
 
@@ -636,13 +952,18 @@ function MonthView() {
   const rows = [];
   let grand = 0;
 
-  friends().forEach((u) => {
-    const r = { u, b: 0, l: 0, d: 0, total: 0 };
+  const people = state.me.role === "provider" ? friends() : [state.me];
+
+  people.forEach((u) => {
+    const r = { u, counts: MEALS.map(() => 0), total: 0, rejected: 0 };
     Object.values(state.entries).forEach((e) => {
       if (e.userId !== u.id || e.date < from || e.date > to) return;
       MEALS.forEach((m, idx) => {
         const v = e[m.key];
-        if (v && v.taken) { r[["b", "l", "d"][idx]] += 1; r.total += Number(v.amount || 0); }
+        if (!v) return;
+        if (v.status === "rejected") { r.rejected += 1; return; }
+        r.counts[idx] += 1;
+        r.total += Number(v.amount || 0);
       });
     });
     grand += r.total; rows.push(r);
@@ -652,35 +973,20 @@ function MonthView() {
     h("div", { class: "card-head" }, h("h2", {}, monthLabel(state.date))),
     h("div", { class: "tablewrap" }, h("table", {},
       h("thead", {}, h("tr", {},
-        h("th", {}, "Person"), h("th", { class: "num" }, "B"), h("th", { class: "num" }, "L"),
-        h("th", { class: "num" }, "D"), h("th", { class: "num" }, "Meals"),
+        h("th", {}, "Person"),
+        MEALS.map((m) => h("th", { class: "num", title: m.label }, m.label[0])),
+        h("th", { class: "num" }, "Orders"),
         h("th", { style: "text-align:right" }, "Total"))),
       h("tbody", {}, rows.map((r) => h("tr", {},
         h("td", { class: "name" }, h("div", { class: "who" }, Avatar(r.u, "sm"), r.u.name)),
-        h("td", { class: "num" }, r.b), h("td", { class: "num" }, r.l), h("td", { class: "num" }, r.d),
-        h("td", { class: "num" }, r.b + r.l + r.d),
+        r.counts.map((c) => h("td", { class: "num" }, c)),
+        h("td", { class: "num" }, r.counts.reduce((s, c) => s + c, 0)),
         h("td", { class: "amt", style: "text-align:right" }, money(r.total))))),
       h("tfoot", {}, h("tr", {},
-        h("td", { colspan: "4" }, "Group total"),
-        h("td", { class: "num" }, rows.reduce((s, r) => s + r.b + r.l + r.d, 0)),
-        h("td", { class: "amt", style: "text-align:right" }, money(grand)))))),
-    h("p", { class: "note" }, "B = breakfast, L = lunch, D = dinner. Counts are meals marked “taken”.")));
+        h("td", { colspan: String(MEALS.length + 1) }, "Group total"),
+        h("td", { class: "num" }, rows.reduce((s, r) => s + r.counts.reduce((a, c) => a + c, 0), 0)),
+        h("td", { class: "amt", style: "text-align:right" }, money(grand))))))));
 
-  const p = provider();
-  if (p) {
-    let tiffins = 0, days = 0;
-    Object.values(state.entries).forEach((e) => {
-      if (e.userId !== p.id || e.date < from || e.date > to) return;
-      const n = MEALS.reduce((s, m) => s + ((e[m.key] && e[m.key].count) || 0), 0);
-      if (n) { tiffins += n; days += 1; }
-    });
-    box.appendChild(h("div", { class: "card person-block" },
-      h("div", { class: "ph" }, Avatar(p, "md"), h("strong", {}, p.name),
-        h("span", { class: "tot" }, `${tiffins} tiffins`)),
-      h("div", { class: "meal-line", style: "border-top:none;padding:4px 0 0" },
-        h("div", { class: "mb", style: "color:var(--muted);font-size:13.5px" },
-          `Delivered across ${days} day${days === 1 ? "" : "s"} this month`))));
-  }
   return box;
 }
 
@@ -704,6 +1010,19 @@ function SettingsScreen() {
         toast("Name updated");
       } }, "Update name"))));
 
+  if (state.me.role !== "provider") {
+    const addrInput = h("input", { type: "text", value: state.me.address || "", maxlength: "160",
+      placeholder: "Flat / building / landmark" });
+    box.appendChild(h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, "Delivery address")),
+      addrInput,
+      h("div", { class: "actions left" },
+        h("button", { class: "btn ghost", type: "button", onclick: async () => {
+          await Store.updateUser(state.me.id, { address: addrInput.value.trim() });
+          toast("Address saved");
+        } }, "Save address"))));
+  }
+
   const p1 = h("input", { class: "narrow", type: "tel", inputmode: "numeric", maxlength: "4", placeholder: "New PIN" });
   const p2 = h("input", { class: "narrow", type: "tel", inputmode: "numeric", maxlength: "4", placeholder: "Confirm" });
   box.appendChild(h("div", { class: "card" },
@@ -719,29 +1038,228 @@ function SettingsScreen() {
         await Store.updateUser(state.me.id, { pin: a, isDefaultPin: false });
         p1.value = ""; p2.value = "";
         toast("PIN changed");
-      } }, "Save new PIN")),
-    h("p", { class: "note" }, "All five PINs must be different. There's no recovery — write it down.")));
-
-  box.appendChild(h("div", { class: "card" },
-    h("div", { class: "card-head" }, h("h2", {}, "People")),
-    h("div", { class: "tablewrap" }, h("table", {}, h("tbody", {},
-      state.users.map((u) => h("tr", {},
-        h("td", { class: "name" }, h("div", { class: "who" }, Avatar(u, "sm"), u.name)),
-        h("td", { style: "color:var(--muted)" }, u.role === "provider" ? "Provider" : "Friend"),
-        h("td", { style: "text-align:right" },
-          u.id === state.me.id ? h("span", { class: "pill b" }, "you")
-            : h("span", { class: "pill q" }, u.isDefaultPin ? "starter PIN" : "PIN set")))))))));
+      } }, "Save new PIN"))));
 
   box.appendChild(h("div", { class: "actions left" },
     h("button", { class: "btn danger", type: "button", onclick: () => {
       localStorage.removeItem(SESSION_KEY);
       if (state.unsubEntries) { state.unsubEntries(); state.unsubEntries = null; }
+      if (state.unsubAll) { state.unsubAll(); state.unsubAll = null; }
       state.me = null; state.draft = null; state.draftDate = null;
       state.rangeFrom = null; state.rangeTo = null; state.entriesReady = false;
       state.authStage = "role"; state.authRole = null;
       state.authUserId = null; state.authLabel = null;
+      state.overlay = null; state.historyMeal = null;
+      state.historyFrom = null; state.historyTo = null;
+      state.allEntries = {}; state.allEntriesReady = false;
       mounted = null;
       renderAuth();
     } }, "Log out")));
+  return box;
+}
+
+// ---------------------------------------------------------------- hamburger menu
+function HamburgerMenu() {
+  return h("button", { class: "hamburger-btn", type: "button", "aria-label": "Menu",
+    onclick: (e) => { e.stopPropagation(); toggleHamMenu(); } }, "☰");
+}
+function toggleHamMenu() {
+  if (closeHamMenu()) return; // was open, just close it
+  const jump = (tab) => { closeHamMenu(); closeOverlay(); goTo(tab); };
+  const menu = h("div", { class: "ham-menu" },
+    h("button", { type: "button", onclick: () => { closeHamMenu(); openOverlay("bills"); } },
+      h("span", { class: "hm-ic" }, "🧾"), "Bills"),
+    h("button", { type: "button", onclick: () => { closeHamMenu(); openOverlay("history"); } },
+      h("span", { class: "hm-ic" }, "📜"), "History"),
+    h("div", { class: "hm-sep" }),
+    h("button", { type: "button", onclick: () => jump("dash") },
+      h("span", { class: "hm-ic" }, "📊"), "Dashboard"),
+    h("button", { type: "button", onclick: () => jump("settings") },
+      h("span", { class: "hm-ic" }, "⚙"), "Settings"));
+  const backdrop = h("button", { class: "ham-backdrop", type: "button", "aria-label": "Close menu",
+    onclick: () => closeHamMenu() });
+  app.appendChild(backdrop);
+  app.appendChild(menu);
+}
+/** Removes any open hamburger dropdown. Returns true if one was open. */
+function closeHamMenu() {
+  const found = document.querySelector(".ham-menu, .ham-backdrop");
+  document.querySelectorAll(".ham-menu, .ham-backdrop").forEach((el) => el.remove());
+  return !!found;
+}
+
+// ---------------------------------------------------------------- Bills / History overlay
+/** Lifetime, all-users entry feed backing Bills + History. Loaded once, lazily. */
+function ensureAllEntries() {
+  if (state.unsubAll) return; // already subscribed (ready or loading)
+  state.unsubAll = Store.onEntries(EARLIEST_DATE, todayStr(), (map) => {
+    state.allEntries = map;
+    state.allEntriesReady = true;
+    if (state.overlay) renderOverlay();
+  });
+}
+function openOverlay(kind) {
+  state.overlay = kind;
+  state.historyMeal = null;
+  state.historyFrom = null;
+  state.historyTo = null;
+  ensureAllEntries();
+  renderOverlay();
+}
+function closeOverlay() {
+  stopTick();
+  state.overlay = null;
+  state.historyMeal = null;
+  state.orderMeal = null;
+  state.orderDate = null;
+  state.orderDraft = null;
+  const existing = app.querySelector(".overlay-screen");
+  if (existing) existing.remove();
+}
+function renderOverlay() {
+  stopTick();
+  const existing = app.querySelector(".overlay-screen");
+  if (existing) existing.remove();
+  if (!state.overlay) return;
+  const screen = state.overlay === "bills" ? BillsScreen()
+    : state.overlay === "order" ? OrderScreen()
+    : HistoryScreen();
+  app.appendChild(screen);
+}
+
+/** Sum of everything this user marked "taken", across all recorded history. */
+function lifetimeTotal(uid) {
+  return Object.values(state.allEntries).reduce((sum, e) => {
+    if (e.userId !== uid) return sum;
+    return sum + MEALS.reduce((s, m) => s + (e[m.key] && e[m.key].taken ? Number(e[m.key].amount || 0) : 0), 0);
+  }, 0);
+}
+function mealBreakdown(uid) {
+  const out = {};
+  MEALS.forEach((m) => (out[m.key] = { count: 0, amount: 0 }));
+  Object.values(state.allEntries).forEach((e) => {
+    if (e.userId !== uid) return;
+    MEALS.forEach((m) => {
+      const v = e[m.key];
+      if (v && v.taken) { out[m.key].count += 1; out[m.key].amount += Number(v.amount || 0); }
+    });
+  });
+  return out;
+}
+function itemsFromTiffins(tiffins) {
+  return (tiffins || [])
+    .map((t, i) => { const txt = itemsText(t.items); return txt ? `T${i + 1}: ${txt}` : null; })
+    .filter(Boolean).join(" · ");
+}
+
+function OverlayShell(title, onBack) {
+  const wrap = h("div", { class: "overlay-screen" },
+    h("div", { class: "overlay-header" },
+      h("button", { class: "ov-back", type: "button", onclick: onBack }, "←"),
+      h("h1", { class: "page-title" }, title)));
+  const body = h("div", { class: "overlay-body" });
+  wrap.appendChild(body);
+  return { wrap, body };
+}
+
+function BillsScreen() {
+  const { wrap, body } = OverlayShell("Bills", closeOverlay);
+  if (!state.allEntriesReady) { body.appendChild(loadingBlock()); return wrap; }
+
+  if (state.me.role === "provider") {
+    let grand = 0;
+    const cards = friends().map((u) => {
+      const total = lifetimeTotal(u.id);
+      grand += total;
+      return h("div", { class: "card person-block" },
+        h("div", { class: "ph" }, Avatar(u, "md"), h("strong", {}, u.name), h("span", { class: "tot" }, money(total))));
+    });
+    body.appendChild(h("div", { class: "card bill-total-card" },
+      h("div", { class: "bt-label" }, "Total to collect"),
+      h("div", { class: "bt-amt" }, money(grand)),
+      h("div", { class: "bt-note" }, "Across all friends, all time")));
+    cards.forEach((c) => body.appendChild(c));
+  } else {
+    const total = lifetimeTotal(state.me.id);
+    const br = mealBreakdown(state.me.id);
+    body.appendChild(h("div", { class: "card bill-total-card" },
+      h("div", { class: "bt-label" }, "Your total"),
+      h("div", { class: "bt-amt" }, money(total)),
+      h("div", { class: "bt-note" }, "All time, everything marked Taken")));
+    body.appendChild(h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, "By meal")),
+      MEALS.map((m) => h("div", { class: "meal-line" },
+        h("div", { class: "ml" }, m.label),
+        h("div", { class: "mb" }, `${br[m.key].count} time${br[m.key].count === 1 ? "" : "s"}`),
+        h("div", { class: "mr" }, money(br[m.key].amount))))));
+  }
+  return wrap;
+}
+
+function HistoryScreen() {
+  const back = () => {
+    if (state.historyMeal) { state.historyMeal = null; state.historyFrom = null; state.historyTo = null; renderOverlay(); }
+    else closeOverlay();
+  };
+  const title = state.historyMeal ? MEALS.find((m) => m.key === state.historyMeal).label + " history" : "History";
+  const { wrap, body } = OverlayShell(title, back);
+  if (!state.allEntriesReady) { body.appendChild(loadingBlock()); return wrap; }
+
+  if (!state.historyMeal) {
+    body.appendChild(h("div", { class: "history-meal-grid" },
+      MEALS.map((m) => h("button", { class: "history-meal-opt", type: "button",
+        onclick: () => { state.historyMeal = m.key; state.historyFrom = null; state.historyTo = null; renderOverlay(); } },
+        h("span", { class: "hmi" }, m.icon), h("strong", {}, m.label), h("span", { class: "arrow" }, "›")))));
+    return wrap;
+  }
+
+  body.appendChild(HistoryList(state.historyMeal));
+  return wrap;
+}
+
+function HistoryList(mealKey) {
+  const box = h("div", {});
+  // The supplier's history is everyone's orders; a friend sees only their own.
+  const forProvider = state.me.role === "provider";
+  const rows = Object.values(state.allEntries)
+    .filter((e) => e[mealKey] && (forProvider ? e.userId !== state.me.id : e.userId === state.me.id))
+    .sort((a, b) => b.date.localeCompare(a.date) || String(a.userId).localeCompare(String(b.userId)));
+
+  const earliest = rows.length ? rows[rows.length - 1].date : todayStr();
+  if (!state.historyFrom) state.historyFrom = earliest;
+  if (!state.historyTo) state.historyTo = todayStr();
+
+  const fromInput = h("input", { type: "date", value: state.historyFrom, max: state.historyTo,
+    onchange: (e) => { state.historyFrom = e.target.value || earliest; renderOverlay(); } });
+  const toInput = h("input", { type: "date", value: state.historyTo, min: state.historyFrom, max: todayStr(),
+    onchange: (e) => { state.historyTo = e.target.value || todayStr(); renderOverlay(); } });
+  box.appendChild(h("div", { class: "range-bar" },
+    h("div", { class: "range-field" }, h("label", {}, "From"), fromInput),
+    h("div", { class: "range-field" }, h("label", {}, "To"), toInput)));
+
+  const filtered = rows.filter((e) => e.date >= state.historyFrom && e.date <= state.historyTo);
+  if (!filtered.length) {
+    box.appendChild(h("div", { class: "card empty" }, "No orders in this range."));
+    return box;
+  }
+
+  const total = filtered.reduce((s, e) => s + (e[mealKey].taken ? Number(e[mealKey].amount || 0) : 0), 0);
+  box.appendChild(h("p", { class: "note" },
+    `${filtered.length} order${filtered.length === 1 ? "" : "s"} · ${money(total)}`));
+
+  filtered.forEach((e) => {
+    const v = e[mealKey];
+    const who = forProvider ? state.users.find((u) => u.id === e.userId) : null;
+    const row = h("div", { class: "card history-row" },
+      h("div", { class: "hr-date" }, fmtDate(e.date)));
+    const mb = h("div", { class: "mb" }, StatusPill(v));
+    const txt = itemsText(v.items);
+    if (txt) mb.appendChild(h("div", { class: "sub-items" }, txt));
+    if (v.status === "rejected" && v.reason) mb.appendChild(h("div", { class: "sub-items" }, "\u201C" + v.reason + "\u201D"));
+    row.appendChild(h("div", { class: "meal-line", style: "border-top:none;padding-top:0" },
+      who ? h("div", { class: "ml" }, who.name) : null, mb,
+      h("div", { class: "mr" }, v.taken ? money(v.amount) : "")));
+    box.appendChild(row);
+  });
   return box;
 }
