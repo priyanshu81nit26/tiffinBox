@@ -1,0 +1,44 @@
+rules_version = '2';
+
+// ------------------------------------------------------------------
+//  This app has no login/auth by design, so these rules cannot verify
+//  *who* is writing. They only lock the project down to these two
+//  collections and enforce the shape of the data, so a stranger who
+//  found your project can't dump arbitrary junk into it or delete
+//  history. Keep your hosting URL private, and don't store anything
+//  sensitive here.
+// ------------------------------------------------------------------
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{userId} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasOnly(['name','role','pin','isDefaultPin','order'])
+                    && request.resource.data.pin is string
+                    && request.resource.data.pin.size() == 4;
+      allow update: if request.resource.data.keys().hasOnly(['name','role','pin','isDefaultPin','order'])
+                    && request.resource.data.pin is string
+                    && request.resource.data.pin.size() == 4
+                    && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0
+                    && request.resource.data.name.size() < 40
+                    && request.resource.data.role == resource.data.role;
+      allow delete: if false;
+    }
+
+    match /entries/{entryId} {
+      allow read: if true;
+      allow create, update: if request.resource.data.date is string
+                            && request.resource.data.date.size() == 10
+                            && request.resource.data.userId is string
+                            && request.resource.data.keys().hasOnly(
+                                 ['date','userId','role','breakfast','lunch','dinner','updatedAt']);
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
